@@ -24,9 +24,9 @@ require 'bunny'
 module Thrift
   class AmqpRpcServer < BaseServer
 
-    def initialize(processor, opts={})
+    class ProcessingTimeout < Timeout::Error; end
 
-      @log_messages = true
+    def initialize(processor, opts={})
 
       @processor = processor
 
@@ -58,20 +58,8 @@ module Thrift
       end
 
       @queue_name = opts[:queue_name]
-      @protocol_factory = opts[:protocol_factory] || BinaryProtocolFactory.new
-
-      #Create a channel to the service queue
-      @request_channel = @conn.create_channel
-
+      @protocol_factory = opts[:protocol_factory] || BinaryProtocolFactory
       @exchange = opts[:exchange] || nil
-
-      if @exchange.nil?
-        @service_exchange = @request_channel.default_exchange
-        @request_queue = @request_channel.queue(@queue_name, :auto_delete => true)
-      else
-        @service_exchange = @request_channel.direct(@exchange,:durable => true)
-        @request_queue = @request_channel.queue(@queue_name, :auto_delete => true).bind(@service_exchange, :routing_key => @queue_name)
-      end
 
     end
 
@@ -86,90 +74,92 @@ module Thrift
 
     end
 
-    def serve
 
-      @request_cnt = 0
 
-      @thread_pool = Set.new []
+    def serve(options={})
+      log_messages = options[:log_messages] || false
+      max_messages = options[:max_messages].nil? ? 10 : options[:max_messages]
+      response_timeout = options[:response_timeout] || 10
+
+      #Create a channel to the service queue
+      @request_channel = @conn.create_channel(nil, max_messages )
+
+      if @exchange.nil?
+        @service_exchange = @request_channel.default_exchange
+        @request_queue = @request_channel.queue(@queue_name, :auto_delete => true)
+      else
+        @service_exchange = @request_channel.direct(@exchange,:durable => true)
+        @request_queue = @request_channel.queue(@queue_name, :auto_delete => true).bind(@service_exchange, :routing_key => @queue_name)
+      end
 
       @request_queue.subscribe(:block => true) do |delivery_info, properties, payload|
 
-        if @log_messages
-          print "Message received, number of threads currently running: #{@thread_pool.size()}\n"
-          print "headers: #{properties}\n"
-          print "payload: #{payload.strip}\n"
+        if log_messages
+          Thread.current["correlation_id"] = properties.correlation_id
+          print_log "---- Message received ----"
+          print_log "HEADERS: #{properties}"
         end
 
-        #Trying to manage the number of threads to be spawned
-        if @thread_pool.size() > 10  #TODO - externalize this or make it dynamically configurable
-          print "Too many threads #{@thread_pool.size()} are open to handle this message. The message will be requeued"
-          @request_channel.reject(delivery_info.delivery_tag, true)      #requeue the message
-        else
+        Thread.current["correlation_id"] = properties.correlation_id
 
-          @request_cnt += 1
+        response_channel = @conn.create_channel
+        response_exchange = response_channel.default_exchange
 
-          thread = Thread.new {
+        response_required = properties.headers.has_key?('response_required') ? properties.headers['response_required'] : true
+        process_timeout = response_timeout.to_i > properties.expiration.to_i ? response_timeout.to_i : properties.expiration.to_i
 
-            response_channel = @conn.create_channel
-            response_exchange = response_channel.default_exchange
+        #Binary content will imply thrift based message payload
+        if properties.content_type == 'application/octet-stream'
 
-            response_required = properties.headers.has_key?('response_required') ? properties.headers['response_required'] : true
+          print_log "Request to process #{@queue_name}.#{properties.headers['operation']} in #{process_timeout}sec" if log_messages
 
+          input = StringIO.new payload
+          out = StringIO.new
+          transport = IOStreamTransport.new input, out
+          protocol = @protocol_factory.new.get_protocol transport
+
+          begin
             start_time = Time.now
-
-            #Binary content will imply thrift based message payload
-            if properties.content_type == 'application/octet-stream'
-
-              input = StringIO.new payload
-              out = StringIO.new
-              transport = IOStreamTransport.new input, out
-              protocol = @protocol_factory.get_protocol transport
-
+            Timeout.timeout(process_timeout, ProcessingTimeout) do
               @processor.process protocol, protocol
+            end
+            processing_time = Time.now - start_time
 
-              stop_time = Time.now
-
-              #rewind the buffer for reading
+            #rewind the buffer for reading
+            if out.length > 0
               out.rewind
 
-              if @log_messages
-                print "Time to process request: #{stop_time - start_time}sec\n"
-                print "response: #{out.read(out.length).strip}\n"
-                #rewind the buffer for reading
-                out.rewind
-              end
+              print_log "Time to process request: #{processing_time}sec  Response length: #{out.length}"   if log_messages
 
-              #only send a response if the operation is not defined as a oneway, otherwise messages will build up in client reply queue
               if response_required
-                #Don't respond if expired
-                if stop_time.to_i <= properties.expiration.to_i
-                  response_exchange.publish(out.read(out.length), :routing_key => properties.reply_to, :correlation_id => properties.correlation_id, :content_type => 'application/octet-stream' )
-                else
-                  response_exchange.publish("Service #{properties.headers['service_name']} request for #{properties.headers['operation']} timed out",
-                                            :routing_key => properties.reply_to, :correlation_id => properties.correlation_id, :content_type => 'text/plain' )
-                end
+                response_exchange.publish(out.read(out.length),
+                                          :routing_key => properties.reply_to,
+                                          :correlation_id => properties.correlation_id,
+                                          :content_type => 'application/octet-stream' )
               end
-
-            else
-
-              print "Unable to process message content of type #{properties.content_type}. The message will be rejected"
-              @request_channel.reject(delivery_info.delivery_tag, false)      #requeue the message
-
             end
 
-            response_channel.close
+          rescue ProcessingTimeout => ex
+            print_log "A timeout has occurred (#{process_timeout}sec) trying to call #{@queue_name}.#{properties.headers['operation']}"
+          end
 
-            @thread_pool.delete(Thread.current)
+        else
 
-            Thread.exit
-
-          }
-
-          @thread_pool.add(thread)
+          print_log "Unable to process message content of type #{properties.content_type}. The message will be rejected"
+          @request_channel.reject(delivery_info.delivery_tag, false)
 
         end
 
+        response_channel.close
+
+
       end
+    end
+
+    private
+
+    def print_log(message="")
+      puts "#{Time.now.utc} S Thread: #{Thread.current.object_id} CID:#{Thread.current["correlation_id"]} - #{message}"
 
     end
   end

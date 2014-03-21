@@ -163,13 +163,17 @@ elsif ARGV[0] == "http"
   server = Thrift::MongrelHTTPServer.new(processor, { :ip => '127.0.0.1', :port => "8081"})
   #server = Thrift::MongrelHTTPServer.new(processor, { :ip => '127.0.0.1', :port => "8081", :protocol_factory => Thrift::CompactProtocolFactory.new})
 else
-  server = Thrift::AmqpRpcServer.new(processor, opts = {:host => '127.0.0.1', :port => 5672, :queue_name => 'rpc_queue', :exchange => 'rpc_services'})
+  server = Thrift::AmqpRpcServer.new(processor,
+                                     opts = {:host => '127.0.0.1',
+                                             :port => 5672,
+                                             :queue_name => 'rpc_queue',
+                                             :exchange => 'rpc_services'})
 end
 
 
 begin
   puts "Starting the server..."
-  server.serve()
+  server.serve(:log_messages => true)
   puts "done."
 rescue Interrupt => _
   server.close()

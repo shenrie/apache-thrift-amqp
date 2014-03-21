@@ -35,6 +35,7 @@ class CalculatorClient < Calculator::Client
     @oprot.write_message_begin(name, Thrift::MessageTypes::CALL, @seqid)
     data = args_class.new
     fld = 1
+
     args.each do |k, v|
         
       if data.struct_fields[fld][:type] == Thrift::Types::STRUCT and data.struct_fields[fld][:class] == Json_data
@@ -53,7 +54,15 @@ class CalculatorClient < Calculator::Client
       raise e
     end
     @oprot.write_message_end
-    @oprot.trans.flush
+
+    #If the oneway modifier is used in the thrift definition, then the recv_ version of the methods will
+    #not be generated, so if it does not exist then no need to wait for a response.
+    blocking_call = self.respond_to?("recv_" + name)
+
+    @oprot.trans.flush(:operation => name,
+                       :blocking => blocking_call,
+                       :log_messages => true)
+
   end
 
   def receive_message(result_klass)
@@ -86,13 +95,13 @@ begin
   elsif ARGV[0] == "http"
     transport = Thrift::HTTPClientTransport.new("http://127.0.0.1:8081/calc")
   else
-    transport = Thrift::AmqpRpcClientTransport.new("rpc_queue", opts = {:host => '127.0.0.1', :port => 5672})
+    transport = Thrift::AmqpRpcClientTransport.new("rpc_queue", opts = {:host => '127.0.0.1',
+                                                                        :port => 5672,
+                                                                        :from_name => 'RubyClient'})
   end
 
   protocol = Thrift::BinaryProtocol.new(transport)
   client = CalculatorClient.new(protocol)
-
-  transport.open()
 
   client.ping()
   print "ping()\n"
